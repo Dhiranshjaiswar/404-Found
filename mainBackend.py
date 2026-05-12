@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from fake_news import analyze
+from fake_news import analyze_final
 
 app = FastAPI()
 
@@ -28,5 +28,5 @@ def home():
 
 @app.post("/analyze")
 def check_news(news: NewsRequest):
-    result = analyze(news.url)
+    result = analyze_final(news.url)
     return result
