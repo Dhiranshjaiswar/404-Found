@@ -1,65 +1,73 @@
-import os
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader, random_split
 import torch
+import torch.nn as nn
+import torch.optim as optim
 import timm
-import numpy as np
-from PIL import Image
-from sklearn.linear_model import LogisticRegression
-import pickle
+from tqdm import tqdm
 
-# -----------------------------
-# Load pretrained CNN (feature extractor)
-# -----------------------------
-model = timm.create_model('resnet18', pretrained=True, num_classes=0)
-model.eval()
+# Device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# -----------------------------
-# Function to extract features
-# -----------------------------
-def extract_features(img_path):
-    img = Image.open(img_path).convert("RGB")
-    img = img.resize((224, 224))
+# Transform
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+])
 
-    img = torch.tensor(np.array(img)).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+# Load full dataset
+full_dataset = datasets.ImageFolder("dataset", transform=transform)
 
-    with torch.no_grad():
-        features = model(img)
+# Split dataset
+train_size = int(0.8 * len(full_dataset))
+val_size = len(full_dataset) - train_size
 
-    return features.numpy().flatten()
+train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
 
-# -----------------------------
-# Load dataset
-# -----------------------------
-X = []
-y = []
+# Loaders
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=32)
 
-real_path = "dataset_small/real"
-fake_path = "dataset_small/fake"
+# Model
+model = timm.create_model('resnet18', pretrained=True, num_classes=2)
+model.to(device)
 
-# REAL images = label 0
-for file in os.listdir(real_path):
-    img_path = os.path.join(real_path, file)
-    X.append(extract_features(img_path))
-    y.append(0)
+# Loss & Optimizer
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=0.0001)
 
-# FAKE images = label 1
-for file in os.listdir(fake_path):
-    img_path = os.path.join(fake_path, file)
-    X.append(extract_features(img_path))
-    y.append(1)
+# Train
+epochs = 5
 
-X = np.array(X)
-y = np.array(y)
+for epoch in range(epochs):
 
-# -----------------------------
-# Train ML model
-# -----------------------------
-clf = LogisticRegression(max_iter=1000)
-clf.fit(X, y)
+    model.train()
+    running_loss = 0
 
-# -----------------------------
+    loop = tqdm(train_loader)
+
+    for images, labels in loop:
+
+        images = images.to(device)
+        labels = labels.to(device)
+
+        optimizer.zero_grad()
+
+        outputs = model(images)
+
+        loss = criterion(outputs, labels)
+
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item()
+
+        loop.set_description(f"Epoch [{epoch+1}/{epochs}]")
+        loop.set_postfix(loss=loss.item())
+
+    print(f"Epoch Loss: {running_loss/len(train_loader)}")
+
 # Save model
-# -----------------------------
-with open("fake_detector.pkl", "wb") as f:
-    pickle.dump(clf, f)
+torch.save(model.state_dict(), "ai_detector.pth")
 
-print("Model trained successfully!")
+print("Training Complete!")
