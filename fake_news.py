@@ -1,7 +1,11 @@
 from groq import Groq
 import requests
+import os
+from dotenv import load_dotenv
 
-client = Groq(api_key="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")
+load_dotenv()
+
+client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 def get_text_from_url(url):
     try:
