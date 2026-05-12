@@ -1,7 +1,7 @@
 from groq import Groq
 import requests
 
-client = Groq(api_key="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")
+client = Groq(api_key="your-groq-api-key-here")
 
 def get_text_from_url(url):
     try:
