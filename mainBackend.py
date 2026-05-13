@@ -1,6 +1,9 @@
 # mainBackend.py
 # 404-Found AI Backend — Fixed Version
 
+import ssl
+ssl._create_default_https_context = ssl._create_unverified_context
+
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -8,6 +11,10 @@ import uvicorn
 import os
 import shutil
 import uuid
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # -----------------------------
 # DEEPFAKE MODEL IMPORTS
@@ -24,6 +31,11 @@ import torchvision.transforms as transforms
 # -----------------------------
 from groq import Groq
 from dotenv import load_dotenv
+
+# -----------------------------
+# OCR IMPORT
+# -----------------------------
+import easyocr
 
 load_dotenv()
 
@@ -53,7 +65,7 @@ app.add_middleware(
 # LOAD DEEPFAKE MODEL AT STARTUP
 # ==============================
 
-print("Loading deepfake detection model...")
+logger.info("Loading deepfake detection model...")
 
 # ResNet18 as feature extractor (num_classes=0 removes the classifier head)
 resnet = timm.create_model('resnet18', pretrained=True, num_classes=0)
@@ -73,13 +85,13 @@ image_transform = transforms.Compose([
 if not os.path.exists("fake_detector.pkl"):
     raise FileNotFoundError(
         "fake_detector.pkl not found. "
-        "Please run train_model.py first to generate it."
+        "Please run train_model.py (sklearn version) first to generate it."
     )
 
 with open("fake_detector.pkl", "rb") as f:
     clf = pickle.load(f)
 
-print("Deepfake model loaded successfully!")
+logger.info("Deepfake model loaded successfully!")
 
 # ==============================
 # LOAD GROQ CLIENT FOR FAKE NEWS
@@ -94,8 +106,15 @@ if not groq_api_key:
     )
 
 groq_client = Groq(api_key=groq_api_key)
+logger.info("Groq client initialized!")
 
-print("Groq client initialized!")
+# ==============================
+# LOAD OCR READER
+# ==============================
+
+logger.info("Loading EasyOCR reader (first run may take a moment)...")
+ocr_reader = easyocr.Reader(['en'], gpu=False)
+logger.info("OCR reader ready!")
 
 # ==============================
 # UPLOAD FOLDER
@@ -150,7 +169,6 @@ REASON: (one short sentence)"""
 
     raw = response.choices[0].message.content.strip()
 
-    # Parse into structured dict
     result = {
         "verdict": "UNKNOWN",
         "credibility_score": 50,
@@ -158,6 +176,7 @@ REASON: (one short sentence)"""
     }
 
     for line in raw.split("\n"):
+        line = line.strip()
         if line.startswith("VERDICT:"):
             result["verdict"] = line.replace("VERDICT:", "").strip()
         elif line.startswith("SCORE:"):
@@ -198,14 +217,15 @@ def predict_news(request: NewsRequest):
     try:
         result = analyze_news_with_groq(text)
     except Exception as e:
+        logger.error(f"News analysis error: {e}")
         raise HTTPException(
             status_code=500,
             detail=f"News analysis failed: {str(e)}"
         )
 
     return {
-        "prediction": result["verdict"],           # "REAL" or "FAKE"
-        "credibility_score": result["credibility_score"],  # 0–100
+        "prediction": result["verdict"],
+        "credibility_score": result["credibility_score"],
         "reason": result["reason"]
     }
 
@@ -219,7 +239,11 @@ ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png"}
 async def detect_deepfake(file: UploadFile = File(...)):
 
     # Validate file extension
-    file_extension = file.filename.rsplit(".", 1)[-1].lower()
+    filename = file.filename or ""
+    if "." not in filename:
+        raise HTTPException(status_code=400, detail="File has no extension")
+
+    file_extension = filename.rsplit(".", 1)[-1].lower()
 
     if file_extension not in ALLOWED_EXTENSIONS:
         raise HTTPException(
@@ -228,12 +252,10 @@ async def detect_deepfake(file: UploadFile = File(...)):
                    f"Allowed: {', '.join(ALLOWED_EXTENSIONS)}"
         )
 
-    # Save with a unique name to avoid conflicts
     unique_filename = f"{uuid.uuid4().hex}.{file_extension}"
     file_path = os.path.join(UPLOAD_FOLDER, unique_filename)
 
     try:
-        # Save uploaded file to disk
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
@@ -247,16 +269,19 @@ async def detect_deepfake(file: UploadFile = File(...)):
         proba = clf.predict_proba([features])[0]
         confidence = round(float(max(proba)) * 100, 2)
 
-        prediction = "Fake Image" if prediction_label == 1 else "Real Image"
+        # FIX: backend was returning "Fake Image"/"Real Image"
+        # but frontend was checking for "Deepfake"/"Real Image"
+        # Standardized to match frontend expectations
+        prediction = "Deepfake" if prediction_label == 1 else "Real Image"
 
     except Exception as e:
+        logger.error(f"Deepfake detection error: {e}")
         raise HTTPException(
             status_code=500,
             detail=f"Deepfake detection failed: {str(e)}"
         )
 
     finally:
-        # Always clean up the uploaded file from disk
         if os.path.exists(file_path):
             os.remove(file_path)
 
@@ -267,12 +292,69 @@ async def detect_deepfake(file: UploadFile = File(...)):
     }
 
 # ==============================
+# OCR ENDPOINT (NEW)
+# ==============================
+
+@app.post("/extract-text")
+async def extract_text_from_image(file: UploadFile = File(...)):
+    """Extract text from an uploaded image using EasyOCR."""
+
+    filename = file.filename or ""
+    if "." not in filename:
+        raise HTTPException(status_code=400, detail="File has no extension")
+
+    file_extension = filename.rsplit(".", 1)[-1].lower()
+
+    if file_extension not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported format '{file_extension}'. Allowed: jpg, jpeg, png"
+        )
+
+    unique_filename = f"ocr_{uuid.uuid4().hex}.{file_extension}"
+    file_path = os.path.join(UPLOAD_FOLDER, unique_filename)
+
+    try:
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        result = ocr_reader.readtext(file_path, detail=0)
+        extracted_text = " ".join(result).strip()
+
+        if not extracted_text:
+            extracted_text = "No text found in image"
+
+    except Exception as e:
+        logger.error(f"OCR error: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"OCR failed: {str(e)}"
+        )
+
+    finally:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+    return {
+        "filename": file.filename,
+        "extracted_text": extracted_text,
+        "word_count": len(extracted_text.split()) if extracted_text else 0
+    }
+
+# ==============================
 # HEALTH CHECK
 # ==============================
 
 @app.get("/health")
 def health_check():
-    return {"status": "healthy"}
+    return {
+        "status": "healthy",
+        "models": {
+            "deepfake_detector": "loaded",
+            "ocr_reader": "loaded",
+            "groq_client": "initialized"
+        }
+    }
 
 # ==============================
 # RUN SERVER
